@@ -33,7 +33,7 @@ variables back and forth.
 #### Read Packet
 
  1. **Bit 8**: Write bit, set to zero since we are reading
- 2. **Bits 1-7, 9-15**: Register number to read(little endian)
+ 2. **Bits 0-7, 9-15**: Register number to read(little endian)
  3. **Bits 16-23**: CRC of bits 0-15
 
 #### Read-ACK Packet
@@ -45,7 +45,7 @@ variables back and forth.
 #### Write Packet
 
  1. **Bit 8**: Write bit, set to one since we are writing
- 2. **Bits 1-7, 9-15**: Register number to write to
+ 2. **Bits 0-7, 9-15**: Register number to write to
  3. **Bits 16-47**: Data to write to the register
  3. **Bits 48-55**: CRC of bits 0-47
 
@@ -55,8 +55,22 @@ variables back and forth.
 
 #### NAK Packet
 
- 1. **Bits 0-7**: NAK byte, equal to 0x00. Any byte other than 0xAA should be
- handled as a NAK
+ 1. **Bits 0-7**: NAK code. Any byte with a value other than 0xAA is a NAK,
+ however it is recommended you use the following codes to indicate to the
+ primary what the failure is.
+
+##### NAK Codes
+ * **0x00**: Unknown, highly recommended to avoid sending this on purpose
+ * **0x01**: SecondaryFailure, basically any computation error that is not due
+ to transmission or primary fault
+ * **0x02**: BadCrc, whenever there is a mismatch between the sent CRC and the
+ computed CRC
+ * **0x03**: OutOfBounds, when the primary attempts to access a register which
+ doesn't exist on the secondary
+ * **0x04**: IncompletePacket, when the packet sent to the secondary is missing
+ something
+ * **0x05**: IndexWriteProtected, whenever the secondary attempts to write to a
+ write-protected register
 
 ### Endianness
 
@@ -71,7 +85,7 @@ being the 9th bit in the packet, but the highest bit when programming.
 For example, the array `data` in the following code actually contains the
 bytes `[0b0000_0000, 0b1000_0000]`.
 
-```
+```text
 let register: u16 = 0b1000_0000_0000_0000;
 let data: [u8; 2] = register.to_le_bytes();
 ```
@@ -110,7 +124,7 @@ committed and that there should be a change of code to fix this issue.
 #### Write to Register 0
 
 Primary -> Secondary, write register zero with value 42
-```
+```text
           1                                                             Write Bit
 0000 0000  000 0000                                                     Register
                     0010 1010 0000 0000 0000 0000 0000 0000             Value
@@ -118,7 +132,7 @@ Primary -> Secondary, write register zero with value 42
 ```
 
 Secondary -> Primary, write-ack
-```
+```text
 1010 1010   ACK
 ```
 
@@ -127,22 +141,29 @@ Alternatively, if register 0 is write protected you will get a NAK
 
 Secondary -> Primary, nak
 
-```
-0000 0000   NAK
+```text
+0000 0101   NAK, IndexWriteProtected
 ```
 
 #### Read Register 0
 
 Primary -> Secondary, read register zero
-```
+```text
           1                     Write Bit
 0000 0000  000 0000             Register
                     0000 0000   CRC
 ```
 
 Secondary -> Primary, read-ack with the value 42
-```
+```text
 1010 1010                                                       ACK
           0010 1010 0000 0000 0000 0000 0000 0000               Value
                                                   0100 1111     CRC
 ```
+
+## Legal
+
+These specifications are under
+[CC BY](https://creativecommons.org/licenses/by/4.0/). The source code in this
+repository is under the MIT License, and you can see the LICENSE file for more
+details.

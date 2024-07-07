@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
-
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "usockets", feature(unix_socket_peek))]
+
 #[cfg(feature = "usockets")]
+#[cfg_attr(docsrs, doc(cfg(feature = "usockets")))]
 pub mod usockets;
 
 use core::fmt::Display;
@@ -48,14 +50,36 @@ pub fn crc(data: &[u8]) -> u8 {
 
 /// ACK byte, set to 0xAA due to it's resiliance to most natural interference
 pub static ACK: u8 = 0xAA;
-/// NAK byte
-pub static NAK: u8 = 0x00;
+
+#[repr(u8)]
+#[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
+pub enum NakCode {
+    Unknown = 0,
+    SecondaryFailure = 1,
+    BadCrc = 2,
+    OutOfBounds = 3,
+    IncompletePacket = 4,
+    IndexWriteProtected = 5,
+}
+
+impl From<u8> for NakCode {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::SecondaryFailure,
+            2 => Self::BadCrc,
+            3 => Self::OutOfBounds,
+            4 => Self::IncompletePacket,
+            5 => Self::IndexWriteProtected,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 /// Errors a Primary client or Secondary server can return
 #[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
 pub enum Error<E> {
     Io(E),
-    Nak,
+    Nak(NakCode),
     BadCrc(u8, u8),
     OutOfBounds(u16),
     IncompletePacket,
@@ -69,7 +93,7 @@ where
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Io(e) => write!(f, "{}", e),
-            Error::Nak => write!(f, "NAK Recieved"),
+            Error::Nak(code) => write!(f, "NAK Recieved, code {:?}", code),
             Error::BadCrc(calculated, provided) => write!(
                 f,
                 "Bad Crc, calc'd {:x} provided {:x}",
@@ -219,7 +243,7 @@ where
 
         if register >= registers.len() {
             self.clear()?;
-            self.nak()?;
+            self.nak(NakCode::OutOfBounds)?;
             return Err(Error::OutOfBounds(register as u16));
         }
 
@@ -229,7 +253,7 @@ where
                     Ok(_) => {}
                     Err(e) => {
                         self.clear()?;
-                        self.nak()?;
+                        self.nak(NakCode::SecondaryFailure)?;
                         return Err(e.into());
                     }
                 }
@@ -238,7 +262,7 @@ where
 
                 if crc_calc != 0 {
                     self.clear()?;
-                    self.nak()?;
+                    self.nak(NakCode::BadCrc)?;
                     const CRC_OFFSET: usize = URAP_REG_WIDTH + URAP_DATA_WIDTH;
                     return Err(Error::BadCrc(crc_calc, buffer[CRC_OFFSET]));
                 }
@@ -251,7 +275,7 @@ where
                     registers[register] = data_buffer;
                     self.ack()?;
                 } else {
-                    self.nak()?;
+                    self.nak(NakCode::IndexWriteProtected)?;
                     return Err(Error::IndexWriteProtected(register as u16));
                 }
             }
@@ -259,7 +283,7 @@ where
                 let crc_calc = crc(&buffer[..URAP_REG_WIDTH + URAP_CRC_WIDTH]);
                 if crc_calc != 0 {
                     self.clear()?;
-                    self.nak()?;
+                    self.nak(NakCode::BadCrc)?;
                     const CRC_OFFSET: usize = URAP_REG_WIDTH;
                     return Err(Error::BadCrc(crc_calc, buffer[CRC_OFFSET]));
                 }
@@ -296,8 +320,8 @@ where
     }
 
     /// Write NAK byte
-    fn nak(&mut self) -> Result<(), IO::Error> {
-        self.io.write_all(&[NAK])
+    fn nak(&mut self, code: NakCode) -> Result<(), IO::Error> {
+        self.io.write_all(&[code as u8])
     }
 }
 
@@ -338,7 +362,7 @@ where
         self.io.read_exact(&mut ack_or_nak)?;
 
         if ack_or_nak[0] != ACK {
-            return Err(Error::Nak);
+            return Err(Error::Nak(ack_or_nak[0].into()));
         }
 
         self.io.read_exact(&mut buffer)?;
@@ -407,7 +431,7 @@ where
         self.io.read_exact(&mut ack_or_nak)?;
 
         if ack_or_nak[0] != ACK {
-            return Err(Error::Nak);
+            return Err(Error::Nak(ack_or_nak[0].into()));
         }
 
         Ok(())

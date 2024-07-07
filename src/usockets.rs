@@ -1,3 +1,6 @@
+//! Primary and Secondary client and server for use with Unix Sockets. **Requires
+//! nightly Rust due to [#76923](https://github.com/rust-lang/rust/issues/76923)**
+
 use crate::{
     Error, StdIo, UrapPrimary as UrapPrimaryProto, UrapSecondary as UrapSecondaryProto,
     URAP_DATA_WIDTH,
@@ -16,11 +19,11 @@ pub struct UrapSecondary {
 
 impl UrapSecondary {
     pub fn spawn<const REGCNT: usize>(
-        address: &str,
+        path: &str,
         registers: Arc<Mutex<[[u8; URAP_DATA_WIDTH]; REGCNT]>>,
         writeprotect: [bool; REGCNT],
     ) -> Result<Self, Error<std::io::Error>> {
-        let listener = UnixListener::bind(address)?;
+        let listener = UnixListener::bind(path)?;
 
         let errors: Arc<Mutex<Vec<Error<std::io::Error>>>> = Arc::new(Mutex::new(Vec::new()));
 
