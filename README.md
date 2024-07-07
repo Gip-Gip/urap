@@ -32,8 +32,8 @@ variables back and forth.
 
 #### Read Packet
 
- 1. **Bit 0**: Write bit, set to zero since we are reading
- 2. **Bits 1-15**: Register number to read
+ 1. **Bit 8**: Write bit, set to zero since we are reading
+ 2. **Bits 1-7, 9-15**: Register number to read(little endian)
  3. **Bits 16-23**: CRC of bits 0-15
 
 #### Read-ACK Packet
@@ -44,8 +44,8 @@ variables back and forth.
 
 #### Write Packet
 
- 1. **Bit 0**: Write bit, set to one since we are writing
- 2. **Bits 1-15**: Register number to write to
+ 1. **Bit 8**: Write bit, set to one since we are writing
+ 2. **Bits 1-7, 9-15**: Register number to write to
  3. **Bits 16-47**: Data to write to the register
  3. **Bits 48-55**: CRC of bits 0-47
 
@@ -75,6 +75,9 @@ bytes `[0b0000_0000, 0b1000_0000]`.
 let register: u16 = 0b1000_0000_0000_0000;
 let data: [u8; 2] = register.to_le_bytes();
 ```
+
+This seems baffling when you look at the data being transferred, but to the
+processor and the code written this is as simple as it gets.
 
 ### CRC
 
