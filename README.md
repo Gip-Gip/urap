@@ -58,6 +58,24 @@ variables back and forth.
  1. **Bits 0-7**: NAK byte, equal to 0x00. Any byte other than 0xAA should be
  handled as a NAK
 
+### Endianness
+
+All integers, floats, and etc. past 8 bits are little endian, due to the
+fact that all modern architectures are little endian. This includes register
+addresses.
+
+Note this makes the bit layout look unusual, but it forgoes having to do any
+conversion on 99% of processors. This results in the write bit actually
+being the 9th bit in the packet, but the highest bit when programming.
+
+For example, the array `data` in the following code actually contains the
+bytes `[0b0000_0000, 0b1000_0000]`.
+
+```
+let register: u16 = 0b1000_0000_0000_0000;
+let data: [u8; 2] = register.to_le_bytes();
+```
+
 ### CRC
 
 URAP uses an 8 bit CRC with 0x1D as it's polynomial, the same polynomial used
@@ -90,8 +108,8 @@ committed and that there should be a change of code to fix this issue.
 
 Primary -> Secondary, write register zero with value 42
 ```
-1                                                                       Write Bit
- 000 0000 0000 0000                                                     Register
+          1                                                             Write Bit
+0000 0000  000 0000                                                     Register
                     0010 1010 0000 0000 0000 0000 0000 0000             Value
                                                             0000 1111   CRC
 ```
@@ -114,8 +132,8 @@ Secondary -> Primary, nak
 
 Primary -> Secondary, read register zero
 ```
-0                               Write Bit
- 000 0000 0000 0000             Register
+          1                     Write Bit
+0000 0000  000 0000             Register
                     0000 0000   CRC
 ```
 
