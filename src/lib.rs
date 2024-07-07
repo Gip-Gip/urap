@@ -1,7 +1,8 @@
-#![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "usockets", feature(unix_socket_peek))]
+
 
 #[cfg(feature = "usockets")]
 #[cfg_attr(docsrs, doc(cfg(feature = "usockets")))]
@@ -9,7 +10,9 @@ pub mod usockets;
 
 use core::fmt::Display;
 
-use embedded_io::{ErrorType, Read, ReadExactError, Write};
+use embedded_io::{Read, ReadExactError, Write};
+#[cfg(feature = "std")]
+use embedded_io::ErrorType;
 
 pub const URAP_DATA_WIDTH: usize = 4;
 pub const URAP_CRC_WIDTH: usize = 1;
@@ -140,6 +143,7 @@ where
     io: IO,
 }
 
+#[cfg(feature = "std")]
 impl<IO> StdIo<IO>
 where
     IO: std::io::Read + std::io::Write,
@@ -155,6 +159,7 @@ where
     }
 }
 
+#[cfg(feature = "std")]
 impl<IO> From<IO> for StdIo<IO>
 where
     IO: std::io::Read + std::io::Write,
@@ -165,6 +170,7 @@ where
     }
 }
 
+#[cfg(feature = "std")]
 impl<IO> ErrorType for StdIo<IO>
 where
     IO: std::io::Read + std::io::Write,
@@ -172,6 +178,7 @@ where
     type Error = std::io::Error;
 }
 
+#[cfg(feature = "std")]
 impl<IO> Read for StdIo<IO>
 where
     IO: std::io::Read + std::io::Write,
@@ -182,6 +189,7 @@ where
     }
 }
 
+#[cfg(feature = "std")]
 impl<IO> Write for StdIo<IO>
 where
     IO: std::io::Read + std::io::Write,
