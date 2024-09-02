@@ -7,7 +7,7 @@ Serial, URAP is simple to implement and open to be used by all.
 
 ## Protocol Overview
 URAP is a data communication protocol where a primary client reads and writes
-data to a secondary server, which allows access to up to 2^15 registers, each
+data to a secondary server, which allows access to up to 2^16 registers, each
 32 bits wide. It assumes that it is being trasmitted on a one to one stream
 where no other possible processes or devices can listen in or interpret the
 packets; in other words when communicating over multi-device RS-485 or Ethernet
@@ -17,9 +17,9 @@ means nor is it intended to be.
 There are 5 types of packets and they are all dead simple:
 
  * Read packet, which has the WRITE bit set to zero, contain the WRITE bit,
- the 15 bit register address, and a CRC
+ the 7 bit register count, the 16 bit starting register address, and a CRC
  * Write packet, which has the WRITE bit set to one, contains the WRITE bit,
- the 15 bit register address, the data to write, and a CRC
+ the 7 bit register count, the 16 bit register address, the data to write, and a CRC
  * Read ACK packet, contains an ACK byte, the data read, and a CRC
  * Write ACK packet, contains an ACK byte
  * NAK packet, containes a NAK byte
@@ -32,22 +32,24 @@ variables back and forth.
 
 #### Read Packet
 
- 1. **Bit 8**: Write bit, set to zero since we are reading
- 2. **Bits 0-7, 9-15**: Register number to read(little endian)
- 3. **Bits 16-23**: CRC of bits 0-15
+ 2. **Bit 0**: Write bit, set to zero since we are reading
+ 1. **Bit 1-7**: Register count, the number of registers to be read -1
+ 3. **Bits 8-23**: First register to read(little endian)
+ 4. **Bits 24-31**: CRC of bits 0-23
 
 #### Read-ACK Packet
 
  1. **Bits 0-7**: ACK byte, equal to 0xAA
- 2. **Bits 8-39**: Data contained in the register
- 3. **Bits 40-47**: CRC of bits 8-39
+ 2. **Bits 8-(7 + count * 32)**: Data contained in the registers
+ 3. **Bits (7 + count * 32 + 1)-(7 + count * 32 + 8)**: CRC of bits 8-(7 + count * 32)
 
 #### Write Packet
 
- 1. **Bit 8**: Write bit, set to one since we are writing
- 2. **Bits 0-7, 9-15**: Register number to write to
- 3. **Bits 16-47**: Data to write to the register
- 3. **Bits 48-55**: CRC of bits 0-47
+ 2. **Bit 0**: Write bit, set to one since we are writing
+ 1. **Bit 1-7**: Register count, the number of registers to be read -1
+ 3. **Bits 8-23**: First register to write to
+ 4. **Bits 24-(23 + count * 32)**: Data to write to the register
+ 5. **Bits (23 + count * 32 + 1)-(23 + count * 32 + 8)**: CRC of bits 24-(23 + count * 32)
 
 #### Write-ACK Packet
 
@@ -71,6 +73,9 @@ variables back and forth.
  something
  * **0x05**: IndexWriteProtected, whenever the secondary attempts to write to a
  write-protected register
+ * **0x06**: CountExceedsBounds, when the first register the primary wants to
+ access is in bounds, but a register to be accessed via the count is out of
+ bounds
 
 ### Endianness
 
@@ -125,10 +130,11 @@ committed and that there should be a change of code to fix this issue.
 
 Primary -> Secondary, write register zero with value 42
 ```text
-          1                                                             Write Bit
-0000 0000  000 0000                                                     Register
-                    0010 1010 0000 0000 0000 0000 0000 0000             Value
-                                                            0000 1111   CRC
+1                                                                                   Write Bit
+ 000 0000                                                                           Count -1
+          0000 0000 0000 0000                                                       Register
+                              0010 1010 0000 0000 0000 0000 0000 0000               Value
+                                                                      0000 1111     CRC
 ```
 
 Secondary -> Primary, write-ack
@@ -149,9 +155,10 @@ Secondary -> Primary, nak
 
 Primary -> Secondary, read register zero
 ```text
-          1                     Write Bit
-0000 0000  000 0000             Register
-                    0000 0000   CRC
+0                                           Write Bit
+ 000 0000                                   Count -1
+          0000 0000 0000 0000               Register
+                              0000 0000     CRC
 ```
 
 Secondary -> Primary, read-ack with the value 42

@@ -14,14 +14,26 @@ use embedded_io::{Read, ReadExactError, Write};
 #[cfg(feature = "std")]
 use embedded_io::ErrorType;
 
+/// Number of bytes in a register
 pub const URAP_DATA_WIDTH: usize = 4;
+/// Number of bytes in a CRC
 pub const URAP_CRC_WIDTH: usize = 1;
+/// Number of bytes when addressing a register via URAP
 pub const URAP_REG_WIDTH: usize = 2;
+/// Number of bytes in a count
 pub const URAP_COUNT_WIDTH: usize = 1;
+/// Number of bytes in a head byte
 pub const URAP_HEAD_WIDTH: usize = URAP_COUNT_WIDTH;
+/// Number of bytes in an ACK
 pub const URAP_ACK_WIDTH: usize = 1;
+/// Most significant bit signifying a write in URAP
 pub const URAP_WRITE_OR: u8 = 0x80;
+/// Maximum register that can be accessed in a single packet
 pub const URAP_COUNT_MAX: usize = 128;
+/// Maximum amount of data in a packet
+pub const URAP_MAX_DATA_SIZE: usize = URAP_DATA_WIDTH * URAP_COUNT_MAX;
+/// Maximum size of a single packet
+pub const URAP_MAX_PACKET_SIZE: usize = URAP_HEAD_WIDTH + URAP_REG_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH;
 
 /// CRC Table for polynomial 0x1D
 pub static CRC_TABLE: [u8; 256] = [
@@ -55,10 +67,11 @@ pub fn crc(start_crc: u8, data: &[u8]) -> u8 {
 }
 
 /// ACK byte, set to 0xAA due to it's resiliance to most natural interference
-pub static ACK: u8 = 0xAA;
+pub const ACK: u8 = 0xAA;
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
+/// Possible NAK codes, see README for more info
 pub enum NakCode {
     Unknown = 0,
     SecondaryFailure = 1,
@@ -216,7 +229,7 @@ where
     }
 }
 
-/// Secondary server struct
+/// Secondary server struct, allows you to poll and process incoming packets.
 pub struct UrapSecondary<'a, 'c, IO, const REGCNT: usize>
 where
     IO: Read + Write,
@@ -229,6 +242,8 @@ impl<'a, 'c, IO, const REGCNT: usize> UrapSecondary<'a, 'c, IO, REGCNT>
 where
     IO: Read + Write,
 {
+    /// Create a new secondary server with IO and a slice with boolean values
+    /// corresponding to the write protect status of individual registers.
     pub fn new(
         io: &'a mut IO,
         writeprotect: &'c [bool; REGCNT],
@@ -239,6 +254,8 @@ where
         }
     }
 
+    /// Poll the IO for data, and if there is data return the recieved packet
+    /// to be further processed.
     pub fn poll(&mut self) -> Result<Option<UrapRecievedPacket>, Error<IO::Error>> {
         let mut buffer: [u8; URAP_HEAD_WIDTH + URAP_REG_WIDTH] = [0; URAP_HEAD_WIDTH + URAP_REG_WIDTH];
 
@@ -258,7 +275,7 @@ where
             let start_register = u16::from_le_bytes([buffer[1], buffer[2]]);
 
             if write {
-                let mut buffer: [u8; URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [0; URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
+                let mut buffer: [u8; URAP_MAX_DATA_SIZE + URAP_CRC_WIDTH] = [0; URAP_MAX_DATA_SIZE + URAP_CRC_WIDTH];
 
                 let count_bytes = count as usize * URAP_DATA_WIDTH;
 
@@ -286,7 +303,7 @@ where
                     }
                 };
 
-                let write_buffer: &[[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX] = from_bytes(&buffer[..URAP_DATA_WIDTH * URAP_COUNT_MAX]);
+                let write_buffer: &[[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX] = from_bytes(&buffer[..URAP_MAX_DATA_SIZE]);
 
                 Ok(Some(UrapRecievedPacket {
                     count,
@@ -323,6 +340,7 @@ where
         }
     }
 
+    /// Process a packet read by polling.
     pub fn process(&mut self, recieved_packet: UrapRecievedPacket, registers: &mut [[u8; URAP_DATA_WIDTH]; REGCNT]) -> Result<(), Error<IO::Error>> {
         if let Some(nak_code) = recieved_packet.nak_code {
             self.io.write_all(&[nak_code as u8])?;
@@ -338,7 +356,7 @@ where
 
             self.io.write_all(&[ACK])?;
         } else {
-            let mut buffer: [u8; URAP_ACK_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [ACK; URAP_ACK_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
+            let mut buffer: [u8; URAP_ACK_WIDTH + URAP_MAX_DATA_SIZE + URAP_CRC_WIDTH] = [ACK; URAP_ACK_WIDTH + URAP_MAX_DATA_SIZE + URAP_CRC_WIDTH];
 
             let reg_start_offset = URAP_ACK_WIDTH;
             let reg_end_offset = reg_start_offset + URAP_DATA_WIDTH * recieved_packet.count as usize;
@@ -358,13 +376,19 @@ where
     }
 }
 
+/// A packet recieved during polling.
 pub struct UrapRecievedPacket {
+    /// Number of registers being accessed during operation.
     pub count: u8,
+    /// The first register to be accessed in operation
     pub start_register: u16,
+    /// If None, this is a read operation. If Some, the Some contains the entire write buffer.
     pub write_buffer: Option<[[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX]>,
+    /// If there was an error the Nak code is here; needs to be written to the Primary first.
     pub nak_code: Option<NakCode>,
 }
 
+/// Primary client, used for interacting with a server via IO.
 pub struct UrapPrimary<'a, IO>
 where
     IO: Read + Write,
@@ -372,15 +396,16 @@ where
     io: &'a mut IO,
 }
 
-/// Primary client
 impl<'a, IO> UrapPrimary<'a, IO>
 where
     IO: Read + Write,
 {
+    /// Create a client with IO.
     pub fn new(io: &'a mut IO) -> Self {
         Self { io }
     }
 
+    /// Read `n` registers into an array of `[[u8; 4]; n]`
     pub fn read_4u8(&mut self, start_register: u16, data: &mut [[u8; 4]]) -> Result<(), Error<IO::Error>> {
         assert!(data.len() <= URAP_COUNT_MAX);
 
@@ -430,8 +455,9 @@ where
         Ok(())
     }
  
+    /// Write `n` registers from an array of `[[u8; 4]; n]`
     pub fn write_4u8(&mut self, start_register: u16, data: &[[u8; URAP_DATA_WIDTH]]) -> Result<(), Error<IO::Error>> {
-        assert!(data.len() < URAP_COUNT_MAX);
+        assert!(data.len() <= URAP_COUNT_MAX);
 
         if data.len() == 0 {
             return Ok(());
@@ -443,8 +469,7 @@ where
         let head = count | URAP_WRITE_OR;
         let data_bytes: &[u8] = cast_slice(data);
 
-
-        let mut packet_data: [u8; URAP_HEAD_WIDTH + URAP_REG_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [0; URAP_HEAD_WIDTH + URAP_REG_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
+        let mut packet_data: [u8; URAP_MAX_PACKET_SIZE] = [0; URAP_MAX_PACKET_SIZE];
 
         let data_start_index = URAP_HEAD_WIDTH + URAP_REG_WIDTH;
         let data_end_index = data_start_index + data_bytes.len();

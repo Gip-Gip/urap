@@ -299,6 +299,11 @@ mod tests {
         assert_eq!(f32::from_le_bytes(buffer[0]), f32::INFINITY);
         assert_eq!(u32::from_le_bytes(buffer[1]), 42);
         assert_eq!(i32::from_le_bytes(buffer[2]), -1);
+
+        let mut buffer: [[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX] = [[0; URAP_DATA_WIDTH]; URAP_COUNT_MAX];
+
+        urap_primary.write_4u8(128, &buffer).unwrap();
+        urap_primary.read_4u8(128, &mut buffer).unwrap();
        
         drop(urap_secondary);
 
