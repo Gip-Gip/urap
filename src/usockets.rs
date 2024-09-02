@@ -1,15 +1,15 @@
-//! Primary and Secondary client and server for use with Unix Sockets. **Requires
-//! nightly Rust due to [#76923](https://github.com/rust-lang/rust/issues/76923)**
+//! Primary and Secondary client and server for use with Unix Sockets. 
 
 use crate::{
-    Error, StdIo, UrapPrimary as UrapPrimaryProto, UrapSecondary as UrapSecondaryProto,
-    URAP_DATA_WIDTH,
+    Error, StdIo, UrapPrimary as UrapPrimaryProto, UrapSecondary as UrapSecondaryProto, Read, Write,
+    URAP_DATA_WIDTH, URAP_HEAD_WIDTH, URAP_REG_WIDTH, URAP_COUNT_MAX, URAP_CRC_WIDTH, NakCode,
 };
 use std::{
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
+    vec::Vec,
 };
 
 pub struct UrapSecondary {
@@ -36,19 +36,19 @@ impl UrapSecondary {
                         let regcopy = registers.clone();
                         let error_cpy = error_cpy.clone();
                         stream.set_nonblocking(false).unwrap();
-                        thread::spawn(move || {
-                            let mut buffer: [u8; 1] = [0; 1];
-                            let mut stream: StdIo<UnixStream> = stream.into();
-                            while stream.get_inner_mut().peek(&mut buffer).unwrap_or(0) != 0 {
-                                let mut registers = regcopy.lock().unwrap();
-                                let mut errors = error_cpy.lock().unwrap();
-                                let mut urap_secondary = UrapSecondaryProto::new(
-                                    &mut stream,
-                                    &mut registers,
-                                    &writeprotect,
-                                );
 
+                        thread::spawn(move || {
+                            let mut stream: StdIo<UnixStream> = stream.into();
+ 
+                            let mut urap_secondary = UrapSecondaryProto::new(
+                                &mut stream,
+                                &writeprotect,
+                            );
+
+                            loop {
                                 let result = urap_secondary.poll();
+
+                                let mut errors = error_cpy.lock().unwrap();
 
                                 if let Err(e) = result {
                                     errors.push(e);
@@ -59,12 +59,60 @@ impl UrapSecondary {
                                         .shutdown(Shutdown::Both)
                                         .unwrap_or_default();
 
-                                    drop(registers);
                                     drop(errors);
                                     break;
-                                }
+                                } else if let Ok(result) = result {
+                                    if let Some(packet) = result {
 
-                                drop(registers);
+                                        let nak_code = packet.nak_code.clone();
+
+                                        if let Some(nak_code) = nak_code {
+                                            let e = match nak_code {
+                                                NakCode::SecondaryFailure => Error::SecondaryFailure,
+                                                NakCode::BadCrc => Error::BadCrc,
+                                                NakCode::OutOfBounds => Error::OutOfBounds(packet.start_register),
+                                                NakCode::IncompletePacket => Error::IncompletePacket,
+                                                NakCode::IndexWriteProtected => Error::IndexWriteProtected(packet.start_register),
+                                                NakCode::CountExceedsBounds => Error::CountExceedsBounds(packet.count, packet.start_register),
+                                                NakCode::Unknown => panic!("Unknown NAK code!"),
+                                            };
+
+                                            errors.push(e);
+                                        }
+
+                                        let mut registers = regcopy.lock().unwrap();
+                                        let result = urap_secondary.process(packet, &mut registers);
+                                        if let Err(e) = result {
+                                            errors.push(e);
+                                            // Terminate the connection if there's an error, to prevent
+                                            // either side from hanging
+                                            stream
+                                                .get_inner_mut()
+                                                .shutdown(Shutdown::Both)
+                                                .unwrap_or_default();
+
+                                            drop(registers);
+                                            drop(errors);
+                                            break;
+                                        }
+
+                                        if nak_code.is_some() {
+                                            // Terminate the connection if there's an error, to prevent
+                                            // either side from hanging
+                                            stream
+                                                .get_inner_mut()
+                                                .shutdown(Shutdown::Both)
+                                                .unwrap_or_default();
+
+                                            drop(registers);
+                                            drop(errors);
+                                            break; 
+                                        }
+
+                                        drop(registers)
+                                    }
+                                }
+    
                                 drop(errors);
                             }
                         });
@@ -97,54 +145,57 @@ pub struct UrapPrimary {
 
 impl UrapPrimary {
     pub fn new(path: &str) -> Result<Self, std::io::Error> {
-        let socket = UnixStream::connect(path)?.into();
+        let socket = UnixStream::connect(path)?;
+        socket.set_nonblocking(false).unwrap();
+
+        let socket = socket.into();
 
         Ok(Self { socket })
     }
 
     #[inline]
-    pub fn read_4u8(&mut self, register: u16) -> Result<[u8; 4], Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).read_4u8(register)
+    pub fn read_4u8(&mut self, register: u16, buffer: &mut [[u8; URAP_DATA_WIDTH]]) -> Result<(), Error<std::io::Error>> {
+        UrapPrimaryProto::new(&mut self.socket).read_4u8(register, buffer)
     }
 
-    #[inline]
-    pub fn read_f32(&mut self, register: u16) -> Result<f32, Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).read_f32(register)
-    }
+    //#[inline]
+    //pub fn read_f32(&mut self, register: u16) -> Result<f32, Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).read_f32(register)
+    //}
 
-    #[inline]
-    pub fn read_u32(&mut self, register: u16) -> Result<u32, Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).read_u32(register)
-    }
+    //#[inline]
+    //pub fn read_u32(&mut self, register: u16) -> Result<u32, Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).read_u32(register)
+    //}
 
-    #[inline]
-    pub fn read_i32(&mut self, register: u16) -> Result<i32, Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).read_i32(register)
-    }
+    //#[inline]
+    //pub fn read_i32(&mut self, register: u16) -> Result<i32, Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).read_i32(register)
+    //}
 
     #[inline]
     pub fn write_4u8(
         &mut self,
-        register: u16,
-        buffer: &[u8; 4],
+        start_register: u16,
+        data: &[[u8; 4]],
     ) -> Result<(), Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).write_4u8(register, buffer)
+        UrapPrimaryProto::new(&mut self.socket).write_4u8(start_register, data)
     }
 
-    #[inline]
-    pub fn write_f32(&mut self, register: u16, num: f32) -> Result<(), Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).write_f32(register, num)
-    }
+    //#[inline]
+    //pub fn write_f32(&mut self, register: u16, num: f32) -> Result<(), Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).write_f32(register, num)
+    //}
 
-    #[inline]
-    pub fn write_u32(&mut self, register: u16, num: u32) -> Result<(), Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).write_u32(register, num)
-    }
+    //#[inline]
+    //pub fn write_u32(&mut self, register: u16, num: u32) -> Result<(), Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).write_u32(register, num)
+    //}
 
-    #[inline]
-    pub fn write_i32(&mut self, register: u16, num: i32) -> Result<(), Error<std::io::Error>> {
-        UrapPrimaryProto::new(&mut self.socket).write_i32(register, num)
-    }
+    //#[inline]
+    //pub fn write_i32(&mut self, register: u16, num: i32) -> Result<(), Error<std::io::Error>> {
+    //    UrapPrimaryProto::new(&mut self.socket).write_i32(register, num)
+    //}
 
     #[inline]
     pub fn is_healthy(&mut self) -> bool {
@@ -186,13 +237,22 @@ mod tests {
 
         assert!(urap_primary.is_healthy());
 
-        assert_eq!(urap_primary.read_f32(0).unwrap(), 0.0);
-        assert_eq!(urap_primary.read_u32(1).unwrap(), 0);
-        assert_eq!(urap_primary.read_i32(2).unwrap(), 0);
+        for error in urap_secondary.errors.lock().unwrap().iter() {
+            panic!("{}", error);
+        }
 
-        urap_primary.write_f32(0, f32::INFINITY).unwrap();
-        urap_primary.write_u32(1, 42).unwrap();
-        urap_primary.write_i32(2, -46).unwrap_err();
+        let mut buffer: [[u8; URAP_DATA_WIDTH]; 3] = [[0; URAP_DATA_WIDTH]; 3];
+
+        urap_primary.read_4u8(0, &mut buffer).unwrap();
+
+        urap_primary.write_4u8(0, &[
+            f32::INFINITY.to_le_bytes(),
+            42_u32.to_le_bytes(),
+        ]).unwrap();
+        
+        urap_primary.write_4u8(2, &[
+            (-1_i32).to_le_bytes(),
+        ]).unwrap_err();
 
         let error = urap_secondary.pop_error().unwrap();
         match error {
@@ -202,11 +262,13 @@ mod tests {
             }
         }
 
-        let registers = registers.lock().unwrap();
+        let mut registers = registers.lock().unwrap();
 
         assert_eq!(registers[0], f32::INFINITY.to_le_bytes());
         assert_eq!(registers[1], 42_u32.to_le_bytes());
         assert_eq!(registers[2], 0_i32.to_le_bytes());
+
+        registers[2] = (-1_i32).to_le_bytes();
 
         drop(registers);
 
@@ -214,9 +276,13 @@ mod tests {
 
         let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
 
-        assert_eq!(urap_primary.read_f32(0).unwrap(), f32::INFINITY);
-        assert_eq!(urap_primary.read_u32(1).unwrap(), 42);
-        assert_eq!(urap_primary.read_i32(2).unwrap(), 0);
+        let mut buffer: [[u8; URAP_DATA_WIDTH]; 3] = [[0; URAP_DATA_WIDTH]; 3];
+
+        urap_primary.read_4u8(0, &mut buffer).unwrap();
+        
+        assert_eq!(f32::from_le_bytes(buffer[0]), f32::INFINITY);
+        assert_eq!(u32::from_le_bytes(buffer[1]), 42);
+        assert_eq!(i32::from_le_bytes(buffer[2]), -1);
 
         drop(urap_secondary);
 

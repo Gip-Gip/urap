@@ -1,7 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(feature = "usockets", feature(unix_socket_peek))]
 
 
 #[cfg(feature = "usockets")]
@@ -10,6 +9,7 @@ pub mod usockets;
 
 use core::fmt::Display;
 
+use bytemuck::{bytes_of, cast_slice_mut, checked::{cast_slice, from_bytes}};
 use embedded_io::{Read, ReadExactError, Write};
 #[cfg(feature = "std")]
 use embedded_io::ErrorType;
@@ -17,8 +17,11 @@ use embedded_io::ErrorType;
 pub const URAP_DATA_WIDTH: usize = 4;
 pub const URAP_CRC_WIDTH: usize = 1;
 pub const URAP_REG_WIDTH: usize = 2;
+pub const URAP_COUNT_WIDTH: usize = 1;
+pub const URAP_HEAD_WIDTH: usize = URAP_COUNT_WIDTH;
 pub const URAP_ACK_WIDTH: usize = 1;
-pub const URAP_WRITE_OR: u16 = 0x8000;
+pub const URAP_WRITE_OR: u8 = 0x80;
+pub const URAP_COUNT_MAX: usize = 128;
 
 /// CRC Table for polynomial 0x1D
 pub static CRC_TABLE: [u8; 256] = [
@@ -41,8 +44,8 @@ pub static CRC_TABLE: [u8; 256] = [
 ];
 
 /// Calculate the CRC of given data using the table CRC_TABLE
-pub fn crc(data: &[u8]) -> u8 {
-    let mut crc = 0;
+pub fn crc(start_crc: u8, data: &[u8]) -> u8 {
+    let mut crc = start_crc;
 
     for byte in data {
         crc = CRC_TABLE[(*byte ^ crc) as usize];
@@ -63,6 +66,7 @@ pub enum NakCode {
     OutOfBounds = 3,
     IncompletePacket = 4,
     IndexWriteProtected = 5,
+    CountExceedsBounds = 6,
 }
 
 impl From<u8> for NakCode {
@@ -73,6 +77,7 @@ impl From<u8> for NakCode {
             3 => Self::OutOfBounds,
             4 => Self::IncompletePacket,
             5 => Self::IndexWriteProtected,
+            6 => Self::CountExceedsBounds,
             _ => Self::Unknown,
         }
     }
@@ -83,10 +88,12 @@ impl From<u8> for NakCode {
 pub enum Error<E> {
     Io(E),
     Nak(NakCode),
-    BadCrc(u8, u8),
+    SecondaryFailure,
+    BadCrc,
     OutOfBounds(u16),
     IncompletePacket,
     IndexWriteProtected(u16),
+    CountExceedsBounds(u8, u16),
 }
 
 impl<E> Display for Error<E>
@@ -97,11 +104,8 @@ where
         match self {
             Error::Io(e) => write!(f, "{}", e),
             Error::Nak(code) => write!(f, "NAK Recieved, code {:?}", code),
-            Error::BadCrc(calculated, provided) => write!(
-                f,
-                "Bad Crc, calc'd {:x} provided {:x}",
-                calculated, provided
-            ),
+            Error::SecondaryFailure => write!(f, "Secondary Failure"),
+            Error::BadCrc => write!(f, "Bad Crc"),
             Error::OutOfBounds(index) => write!(
                 f,
                 "Attempted to access index {}, which is out of bounds",
@@ -112,6 +116,12 @@ where
                 f,
                 "Attempted to write to index {}, which is protected",
                 index
+            ),
+            Error::CountExceedsBounds(count, index) => write!(
+                f,
+                "Attempted to access {} registers at index {}, which exceeds bounds",
+                count,
+                index,
             ),
         }
     }
@@ -206,131 +216,242 @@ where
 }
 
 /// Secondary server struct
-pub struct UrapSecondary<'a, 'b, 'c, IO, const REGCNT: usize>
+pub struct UrapSecondary<'a, 'c, IO, const REGCNT: usize>
 where
     IO: Read + Write,
 {
     io: &'a mut IO,
-    registers: &'b mut [[u8; URAP_DATA_WIDTH]; REGCNT],
     writeprotect: &'c [bool; REGCNT],
 }
 
-impl<'a, 'b, 'c, IO, const REGCNT: usize> UrapSecondary<'a, 'b, 'c, IO, REGCNT>
+impl<'a, 'c, IO, const REGCNT: usize> UrapSecondary<'a, 'c, IO, REGCNT>
 where
     IO: Read + Write,
 {
     pub fn new(
         io: &'a mut IO,
-        registers: &'b mut [[u8; URAP_DATA_WIDTH]; REGCNT],
         writeprotect: &'c [bool; REGCNT],
     ) -> Self {
         Self {
             io,
-            registers,
             writeprotect,
         }
     }
 
-    /// Poll occasionally to check for incoming packets
-    pub fn poll(&mut self) -> Result<(), Error<IO::Error>> {
-        let mut buffer: [u8; URAP_REG_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH] =
-            [0; URAP_REG_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH];
+    pub fn poll(&mut self) -> Result<Option<UrapRecievedPacket>, Error<IO::Error>> {
+        let mut buffer: [u8; URAP_HEAD_WIDTH + URAP_REG_WIDTH] = [0; URAP_HEAD_WIDTH + URAP_REG_WIDTH];
 
-        self.io.read_exact(&mut buffer[.. URAP_REG_WIDTH + URAP_CRC_WIDTH])?;
+        let i = self.io.read(&mut buffer)?;
 
-        let reg_buffer: [u8; URAP_REG_WIDTH] = unsafe {
-            buffer[..URAP_REG_WIDTH].try_into().unwrap_unchecked()
-        };
+        if i > 0 {
+            if i < buffer.len() {
+                let buffer_len = buffer.len();
+                self.io.read_exact(&mut buffer[i..buffer_len])?;
+            }
+        
+            let head = buffer[0];
+            let write = head & URAP_WRITE_OR > 0;
+            let count = (head & !URAP_WRITE_OR) + 1;
+            let calcd_crc = crc(0, &buffer);
 
-        let register = u16::from_le_bytes(reg_buffer);
+            let start_register = u16::from_le_bytes([buffer[1], buffer[2]]);
 
-        let registers = &mut self.registers;
+            if write {
+                let mut buffer: [u8; URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [0; URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
 
-        let write = (register & URAP_WRITE_OR) != 0;
-        let register = (register & (URAP_WRITE_OR ^ u16::MAX)) as usize;
+                let count_bytes = count as usize * URAP_DATA_WIDTH;
 
-        if register >= registers.len() {
-            self.clear()?;
-            self.nak(NakCode::OutOfBounds)?;
-            return Err(Error::OutOfBounds(register as u16));
-        }
+                self.io.read_exact(&mut buffer[..count_bytes + URAP_CRC_WIDTH])?;
 
-        match write {
-            true => {
-                match self.io.read_exact(&mut buffer[URAP_REG_WIDTH + URAP_CRC_WIDTH..]) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        self.clear()?;
-                        self.nak(NakCode::SecondaryFailure)?;
-                        return Err(e.into());
+                let calcd_crc = crc(calcd_crc, &buffer[..count_bytes + URAP_CRC_WIDTH]);
+
+                let nak_code = if calcd_crc != 0 {
+                    Some(NakCode::BadCrc)
+                } else if start_register as usize >= REGCNT {
+                    Some(NakCode::OutOfBounds)
+                } else if start_register as usize + count as usize > REGCNT {
+                    Some(NakCode::CountExceedsBounds)
+                } else {
+                    let mut write_protected = false;
+                    
+                    for reg in &self.writeprotect[start_register as usize..start_register as usize + count as usize] {
+                        write_protected = write_protected || *reg;
                     }
-                }
 
-                let crc_calc = crc(&buffer);
-
-                if crc_calc != 0 {
-                    self.clear()?;
-                    self.nak(NakCode::BadCrc)?;
-                    const CRC_OFFSET: usize = URAP_REG_WIDTH + URAP_DATA_WIDTH;
-                    return Err(Error::BadCrc(crc_calc, buffer[CRC_OFFSET]));
-                }
-
-                let data_buffer: [u8; URAP_DATA_WIDTH] = unsafe {
-                    buffer[URAP_REG_WIDTH..URAP_REG_WIDTH+URAP_DATA_WIDTH].try_into().unwrap_unchecked()
+                    if write_protected {
+                        Some(NakCode::IndexWriteProtected)
+                    } else {
+                        None
+                    }
                 };
 
-                if !self.writeprotect[register] {
-                    registers[register] = data_buffer;
-                    self.ack()?;
+                let write_buffer: &[[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX] = from_bytes(&buffer[..URAP_DATA_WIDTH * URAP_COUNT_MAX]);
+
+                Ok(Some(UrapRecievedPacket {
+                    count,
+                    start_register,
+                    write_buffer: Some(*write_buffer),
+                    nak_code,
+                }))
+            } else {
+                let mut buffer: [u8; URAP_CRC_WIDTH] = [0; URAP_CRC_WIDTH];
+
+                self.io.read_exact(&mut buffer)?;
+
+                let calcd_crc = crc(calcd_crc, &buffer[..URAP_CRC_WIDTH]);
+
+                let nak_code = if calcd_crc != 0 {
+                    Some(NakCode::BadCrc)
+                } else if start_register as usize >= REGCNT {
+                    Some(NakCode::OutOfBounds)
+                } else if start_register as usize + count as usize > REGCNT {
+                    Some(NakCode::CountExceedsBounds)
                 } else {
-                    self.nak(NakCode::IndexWriteProtected)?;
-                    return Err(Error::IndexWriteProtected(register as u16));
-                }
+                    None
+                };
+
+                Ok(Some(UrapRecievedPacket{
+                    count,
+                    start_register,
+                    write_buffer: None,
+                    nak_code,
+                }))
             }
-            false => {
-                let crc_calc = crc(&buffer[..URAP_REG_WIDTH + URAP_CRC_WIDTH]);
-                if crc_calc != 0 {
-                    self.clear()?;
-                    self.nak(NakCode::BadCrc)?;
-                    const CRC_OFFSET: usize = URAP_REG_WIDTH;
-                    return Err(Error::BadCrc(crc_calc, buffer[CRC_OFFSET]));
-                }
-
-                let register_val = registers[register].clone();
-                let out_crc = crc(&register_val);
-
-                let buffer: [u8; URAP_ACK_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH] = [
-                    ACK,
-                    register_val[0],
-                    register_val[1],
-                    register_val[2],
-                    register_val[3],
-                    out_crc,
-                ];
-
-                self.io.write_all(&buffer)?; 
-            }
+        } else {
+            Ok(None)
         }
+    }
+
+    pub fn process(&mut self, recieved_packet: UrapRecievedPacket, registers: &mut [[u8; URAP_DATA_WIDTH]; REGCNT]) -> Result<(), Error<IO::Error>> {
+        if let Some(nak_code) = recieved_packet.nak_code {
+            self.io.write_all(&[nak_code as u8])?;
+
+            return Ok(());
+        }
+
+        let start_register = recieved_packet.start_register as usize;
+        let end_register = recieved_packet.start_register as usize + recieved_packet.count as usize;
+
+        if let Some(write_buffer) = recieved_packet.write_buffer {
+            registers[start_register..end_register].copy_from_slice(&write_buffer[start_register..end_register]);
+
+            self.io.write_all(&[ACK])?;
+        } else {
+            let mut buffer: [u8; URAP_ACK_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [ACK; URAP_ACK_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
+
+            let reg_start_offset = URAP_ACK_WIDTH;
+            let reg_end_offset = reg_start_offset + URAP_DATA_WIDTH * recieved_packet.count as usize;
+            let crc_index = reg_end_offset;
+            let buffer_len = reg_end_offset + URAP_CRC_WIDTH;
+
+            buffer[reg_start_offset..reg_end_offset].copy_from_slice(cast_slice(&registers[start_register..end_register]));
+
+            let calcd_crc = crc(0, &buffer[reg_start_offset..reg_end_offset]);
+
+            buffer[crc_index] = calcd_crc;
+
+            self.io.write_all(&buffer[..buffer_len])?;
+        }
+
         Ok(())
     }
 
-    /// Clear data that may be sitting in the input stream
-    fn clear(&mut self) -> Result<(), IO::Error> {
-        let mut buffer: [u8; URAP_REG_WIDTH] = [0; URAP_REG_WIDTH];
-        while self.io.read(&mut buffer).unwrap_or(0) == buffer.len() {}
-        Ok(())
-    }
+    ///// Poll occasionally to check for incoming packets
+    //pub fn poll(&mut self) -> Result<(), Error<IO::Error>> {
+    //    let mut data: [u8; URAP_REG_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH] =
+    //        [0; URAP_REG_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH];
 
-    /// Write ACK byte
-    #[inline]
-    fn ack(&mut self) -> Result<(), IO::Error> {
-        self.io.write_all(&[ACK])
-    }
+    //    self.io.read_exact(&mut data[.. URAP_REG_WIDTH + URAP_CRC_WIDTH])?;
 
-    /// Write NAK byte
-    fn nak(&mut self, code: NakCode) -> Result<(), IO::Error> {
-        self.io.write_all(&[code as u8])
-    }
+    //    let reg_data: [u8; URAP_REG_WIDTH] = unsafe {
+    //        data[..URAP_REG_WIDTH].try_into().unwrap_unchecked()
+    //    };
+
+    //    let register = u16::from_le_bytes(reg_data);
+
+    //    let registers = &mut self.registers;
+
+    //    let write = (register & URAP_WRITE_OR) != 0;
+    //    let register = (register & (URAP_WRITE_OR ^ u16::MAX)) as usize;
+
+    //    if register >= registers.len() {
+    //        self.clear()?;
+    //        self.nak(NakCode::OutOfBounds)?;
+    //        return Err(Error::OutOfBounds(register as u16));
+    //    }
+
+    //    match write {
+    //        true => {
+    //            match self.io.read_exact(&mut data[URAP_REG_WIDTH + URAP_CRC_WIDTH..]) {
+    //                Ok(_) => {}
+    //                Err(e) => {
+    //                    self.clear()?;
+    //                    self.nak(NakCode::SecondaryFailure)?;
+    //                    return Err(e.into());
+    //                }
+    //            }
+
+    //            let crc_calc = crc(&data);
+
+    //            if crc_calc != 0 {
+    //                self.clear()?;
+    //                self.nak(NakCode::BadCrc)?;
+    //                const CRC_OFFSET: usize = URAP_REG_WIDTH + URAP_DATA_WIDTH;
+    //                return Err(Error::BadCrc(crc_calc, data[CRC_OFFSET]));
+    //            }
+
+    //            let data_data: [u8; URAP_DATA_WIDTH] = unsafe {
+    //                data[URAP_REG_WIDTH..URAP_REG_WIDTH+URAP_DATA_WIDTH].try_into().unwrap_unchecked()
+    //            };
+
+    //            if !self.writeprotect[register] {
+    //                registers[register] = data_data;
+    //                self.ack()?;
+    //            } else {
+    //                self.nak(NakCode::IndexWriteProtected)?;
+    //                return Err(Error::IndexWriteProtected(register as u16));
+    //            }
+    //        }
+    //        false => {
+    //            let crc_calc = crc(&data[..URAP_REG_WIDTH + URAP_CRC_WIDTH]);
+    //            if crc_calc != 0 {
+    //                self.clear()?;
+    //                self.nak(NakCode::BadCrc)?;
+    //                const CRC_OFFSET: usize = URAP_REG_WIDTH;
+    //                return Err(Error::BadCrc(crc_calc, data[CRC_OFFSET]));
+    //            }
+
+    //            let register_val = registers[register].clone();
+    //            let out_crc = crc(&register_val);
+
+    //            let data: [u8; URAP_ACK_WIDTH + URAP_DATA_WIDTH + URAP_CRC_WIDTH] = [
+    //                ACK,
+    //                register_val[0],
+    //                register_val[1],
+    //                register_val[2],
+    //                register_val[3],
+    //                out_crc,
+    //            ];
+
+    //            self.io.write_all(&data)?; 
+    //        }
+    //    }
+    //    Ok(())
+    //}
+
+    ///// Clear data that may be sitting in the input stream
+    //pub fn clear(&mut self) -> Result<(), IO::Error> {
+    //    let mut data: [u8; URAP_REG_WIDTH] = [0; URAP_REG_WIDTH];
+    //    while self.io.read(&mut data).unwrap_or(0) == data.len() {}
+    //    Ok(())
+    //}
+}
+
+pub struct UrapRecievedPacket {
+    pub count: u8,
+    pub start_register: u16,
+    pub write_buffer: Option<[[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX]>,
+    pub nak_code: Option<NakCode>,
 }
 
 pub struct UrapPrimary<'a, IO>
@@ -349,90 +470,142 @@ where
         Self { io }
     }
 
-    /// Read 4 bytes from a register
-    pub fn read_4u8(&mut self, register: u16) -> Result<[u8; 4], Error<IO::Error>> {
-        assert_eq!(register & URAP_WRITE_OR, 0);
-        let register = register.to_le_bytes();
-        let crc_val = crc(&register);
+    pub fn read_4u8(&mut self, start_register: u16, data: &mut [[u8; 4]]) -> Result<(), Error<IO::Error>> {
+        assert!(data.len() < URAP_COUNT_MAX);
+        assert_ne!(data.len(), 0);
 
-        let buffer: [u8; URAP_REG_WIDTH + URAP_CRC_WIDTH] = [
-            register[0],
-            register[1],
-            crc_val
+        let start_register = start_register.to_le_bytes();
+
+        let count = (data.len() - 1) as u8;
+
+        let calcd_crc = crc(0, &[count]);
+        let calcd_crc = crc(calcd_crc, &start_register);
+
+        let packet_data: [u8; URAP_COUNT_WIDTH + URAP_REG_WIDTH + URAP_CRC_WIDTH] = [
+            count,
+            start_register[0],
+            start_register[1],
+            calcd_crc
         ];
 
-        self.io.write_all(&buffer)?;
+        self.io.write_all(&packet_data)?;
 
         let mut ack_or_nak: [u8; 1] = [0; 1];
-        let mut buffer: [u8; URAP_DATA_WIDTH + URAP_CRC_WIDTH] = [0; URAP_DATA_WIDTH + URAP_CRC_WIDTH];
-        const CRC_INDEX: usize = URAP_DATA_WIDTH;
 
         self.io.read_exact(&mut ack_or_nak)?;
+
 
         if ack_or_nak[0] != ACK {
             return Err(Error::Nak(ack_or_nak[0].into()));
         }
 
-        self.io.read_exact(&mut buffer)?;
+        let data_bytes: &mut [u8] = cast_slice_mut(data);
 
-        let crc_calc = crc(&buffer);
+        self.io.read_exact(data_bytes)?;
 
-        if crc_calc != 0 {
-            return Err(Error::BadCrc(crc_calc, buffer[CRC_INDEX]));
+        let calcd_crc = crc(0, &data_bytes);
+
+        let mut crc_data: [u8; URAP_CRC_WIDTH] = [0; URAP_CRC_WIDTH];
+
+        self.io.read_exact(&mut crc_data)?;
+
+        if crc(calcd_crc, &crc_data) != 0 {
+            return Err(Error::BadCrc);
         }
 
-        // We know these will be the same size, no need to deal with
-        // checking
-        let buffer: [u8; URAP_DATA_WIDTH] = unsafe {
-            buffer[..URAP_DATA_WIDTH].try_into().unwrap_unchecked()
-        };
-
-        return Ok(buffer);
+        Ok(())
     }
 
-    /// Read an f32 from a register
-    #[inline]
-    pub fn read_f32(&mut self, register: u16) -> Result<f32, Error<IO::Error>> {
-        Ok(f32::from_le_bytes(self.read_4u8(register)?))
-    }
+    ///// Read 4 bytes from a register
+    //pub fn read_4u8(&mut self, register: u16) -> Result<[u8; 4], Error<IO::Error>> {
+    //    assert_eq!(register & URAP_WRITE_OR, 0);
+    //    let register = register.to_le_bytes();
+    //    let crc_val = crc(&register);
 
-    /// Read a u32 from a register
-    #[inline]
-    pub fn read_u32(&mut self, register: u16) -> Result<u32, Error<IO::Error>> {
-        Ok(u32::from_le_bytes(self.read_4u8(register)?))
-    }
+    //    let data: [u8; URAP_REG_WIDTH + URAP_CRC_WIDTH] = [
+    //        register[0],
+    //        register[1],
+    //        crc_val
+    //    ];
 
-    /// Read an i32 from a register
-    #[inline]
-    pub fn read_i32(&mut self, register: u16) -> Result<i32, Error<IO::Error>> {
-        Ok(i32::from_le_bytes(self.read_4u8(register)?))
-    }
+    //    self.io.write_all(&data)?;
 
-    /// Write 4 bytes to a register
-    pub fn write_4u8(
-        &mut self,
-        register: u16,
-        data: &[u8; URAP_DATA_WIDTH],
-    ) -> Result<(), Error<IO::Error>> {
-        assert_eq!(register & URAP_WRITE_OR, 0);
-        let register = (register | URAP_WRITE_OR).to_le_bytes();
+    //    let mut ack_or_nak: [u8; 1] = [0; 1];
+    //    let mut data: [u8; URAP_DATA_WIDTH + URAP_CRC_WIDTH] = [0; URAP_DATA_WIDTH + URAP_CRC_WIDTH];
+    //    const CRC_INDEX: usize = URAP_DATA_WIDTH;
 
-        let mut buffer: [u8; URAP_DATA_WIDTH + URAP_REG_WIDTH + URAP_CRC_WIDTH] = [
-            register[0],
-            register[1],
-            data[0],
-            data[1],
-            data[2],
-            data[3],
-            0,
+    //    self.io.read_exact(&mut ack_or_nak)?;
+
+    //    if ack_or_nak[0] != ACK {
+    //        return Err(Error::Nak(ack_or_nak[0].into()));
+    //    }
+
+    //    self.io.read_exact(&mut data)?;
+
+    //    let crc_calc = crc(&data);
+
+    //    if crc_calc != 0 {
+    //        return Err(Error::BadCrc(crc_calc, data[CRC_INDEX]));
+    //    }
+
+    //    // We know these will be the same size, no need to deal with
+    //    // checking
+    //    let data: [u8; URAP_DATA_WIDTH] = unsafe {
+    //        data[..URAP_DATA_WIDTH].try_into().unwrap_unchecked()
+    //    };
+
+    //    return Ok(data);
+    //}
+
+    ///// Read an f32 from a register
+    //#[inline]
+    //pub fn read_f32(&mut self, register: u16) -> Result<f32, Error<IO::Error>> {
+    //    Ok(f32::from_le_bytes(self.read_4u8(register)?))
+    //}
+
+    ///// Read a u32 from a register
+    //#[inline]
+    //pub fn read_u32(&mut self, register: u16) -> Result<u32, Error<IO::Error>> {
+    //    Ok(u32::from_le_bytes(self.read_4u8(register)?))
+    //}
+
+    ///// Read an i32 from a register
+    //#[inline]
+    //pub fn read_i32(&mut self, register: u16) -> Result<i32, Error<IO::Error>> {
+    //    Ok(i32::from_le_bytes(self.read_4u8(register)?))
+    //}
+    //
+    
+    pub fn write_4u8(&mut self, start_register: u16, data: &[[u8; URAP_DATA_WIDTH]]) -> Result<(), Error<IO::Error>> {
+        assert!(data.len() < URAP_COUNT_MAX);
+        assert_ne!(data.len(), 0);
+
+        let start_register = start_register.to_le_bytes();
+
+        let count = (data.len() - 1) as u8;
+        let head = count | URAP_WRITE_OR;
+        let data_bytes: &[u8] = cast_slice(data);
+
+        let packet_head_data: [u8; URAP_HEAD_WIDTH + URAP_REG_WIDTH] = [
+            head,
+            start_register[0],
+            start_register[1],
         ];
 
-        const CRC_OFFSET: usize = URAP_DATA_WIDTH + URAP_REG_WIDTH;
-        let crc_val = crc(&buffer[..CRC_OFFSET]);
+        let mut packet_data: [u8; URAP_HEAD_WIDTH + URAP_REG_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH] = [0; URAP_HEAD_WIDTH + URAP_REG_WIDTH + URAP_DATA_WIDTH * URAP_COUNT_MAX + URAP_CRC_WIDTH];
 
-        buffer[CRC_OFFSET] = crc_val;
+        let data_start_index = URAP_HEAD_WIDTH + URAP_REG_WIDTH;
+        let data_end_index = data_start_index + data_bytes.len();
+        let crc_index = data_end_index;
+        let packet_end_index = crc_index + 1;
 
-        self.io.write_all(&buffer)?;
+        packet_data[..data_start_index].copy_from_slice(&packet_head_data);
+        packet_data[data_start_index..data_end_index].copy_from_slice(data_bytes);
+
+        let calcd_crc = crc(0, &packet_data[..crc_index]);
+        packet_data[crc_index] = calcd_crc;
+
+        self.io.write_all(&packet_data[..packet_end_index])?;
 
         let mut ack_or_nak: [u8; 1] = [0];
 
@@ -444,29 +617,67 @@ where
 
         Ok(())
     }
+
+    ///// Write 4 bytes to a register
+    //pub fn write_4u8(
+    //    &mut self,
+    //    register: u16,
+    //    data: &[u8; URAP_DATA_WIDTH],
+    //) -> Result<(), Error<IO::Error>> {
+    //    assert_eq!(register & URAP_WRITE_OR, 0);
+    //    let register = (register | URAP_WRITE_OR).to_le_bytes();
+
+    //    let mut data: [u8; URAP_DATA_WIDTH + URAP_REG_WIDTH + URAP_CRC_WIDTH] = [
+    //        register[0],
+    //        register[1],
+    //        data[0],
+    //        data[1],
+    //        data[2],
+    //        data[3],
+    //        0,
+    //    ];
+
+    //    const CRC_OFFSET: usize = URAP_DATA_WIDTH + URAP_REG_WIDTH;
+    //    let crc_val = crc(&data[..CRC_OFFSET]);
+
+    //    data[CRC_OFFSET] = crc_val;
+
+    //    self.io.write_all(&data)?;
+
+    //    let mut ack_or_nak: [u8; 1] = [0];
+
+    //    self.io.read_exact(&mut ack_or_nak)?;
+
+    //    if ack_or_nak[0] != ACK {
+    //        return Err(Error::Nak(ack_or_nak[0].into()));
+    //    }
+
+    //    Ok(())
+    //}
     
-    /// Write an f32 to a register
-    #[inline]
-    pub fn write_f32(&mut self, register: u16, num: f32) -> Result<(), Error<IO::Error>> {
-        self.write_4u8(register, &num.to_le_bytes())
-    }
+    ///// Write an f32 to a register
+    //#[inline]
+    //pub fn write_f32(&mut self, register: u16, num: f32) -> Result<(), Error<IO::Error>> {
+    //    self.write_4u8(register, &num.to_le_bytes())
+    //}
 
-    /// Write a u32 to a register
-    #[inline]
-    pub fn write_u32(&mut self, register: u16, num: u32) -> Result<(), Error<IO::Error>> {
-        self.write_4u8(register, &num.to_le_bytes())
-    }
+    ///// Write a u32 to a register
+    //#[inline]
+    //pub fn write_u32(&mut self, register: u16, num: u32) -> Result<(), Error<IO::Error>> {
+    //    self.write_4u8(register, &num.to_le_bytes())
+    //}
 
-    /// Write an i32 to a register
-    #[inline]
-    pub fn write_i32(&mut self, register: u16, num: i32) -> Result<(), Error<IO::Error>> {
-        self.write_4u8(register, &num.to_le_bytes())
-    }
+    ///// Write an i32 to a register
+    //#[inline]
+    //pub fn write_i32(&mut self, register: u16, num: i32) -> Result<(), Error<IO::Error>> {
+    //    self.write_4u8(register, &num.to_le_bytes())
+    //}
 
-    /// Check if the connection is healthy
+    ///// Check if the connection is healthy
     #[inline]
     pub fn is_healthy(&mut self) -> bool {
-        match self.read_4u8(0) {
+        let mut buffer: [[u8; URAP_DATA_WIDTH]; 1] = [[0; URAP_DATA_WIDTH]; 1];
+        match self.read_4u8(0, &mut buffer) {
             Ok(_) => true,
             Err(_) => false,
         }
