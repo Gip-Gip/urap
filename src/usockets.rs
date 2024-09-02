@@ -72,7 +72,7 @@ impl UrapSecondary {
                                                 NakCode::BadCrc => Error::BadCrc,
                                                 NakCode::OutOfBounds => Error::OutOfBounds(packet.start_register),
                                                 NakCode::IncompletePacket => Error::IncompletePacket,
-                                                NakCode::IndexWriteProtected => Error::IndexWriteProtected(packet.start_register),
+                                                NakCode::IndexWriteProtected => Error::IndexWriteProtected(packet.count, packet.start_register),
                                                 NakCode::CountExceedsBounds => Error::CountExceedsBounds(packet.count, packet.start_register),
                                                 NakCode::Unknown => panic!("Unknown NAK code!"),
                                             };
@@ -222,7 +222,12 @@ mod tests {
 
     #[test]
     fn unix_sockets() {
-        let registers = Arc::new(Mutex::new([[0u8; URAP_DATA_WIDTH]; 3]));
+        const RCOUNT: usize = u16::MAX as usize + 1;
+        let registers = Arc::new(Mutex::new([[0u8; URAP_DATA_WIDTH]; RCOUNT]));
+
+        let mut write_protect: [bool; RCOUNT] = [false; RCOUNT];
+
+        write_protect[2] = true;
 
         let secondary_path = Path::new(SLAVE_PATH);
 
@@ -231,7 +236,7 @@ mod tests {
         }
 
         let mut urap_secondary =
-            UrapSecondary::spawn(SLAVE_PATH, registers.clone(), [false, false, true]).unwrap();
+            UrapSecondary::spawn(SLAVE_PATH, registers.clone(), write_protect).unwrap();
 
         let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
 
@@ -256,34 +261,45 @@ mod tests {
 
         let error = urap_secondary.pop_error().unwrap();
         match error {
-            Error::IndexWriteProtected(_) => {}
+            Error::IndexWriteProtected(_, _) => {}
             _ => {
                 panic!("Incorrect Error Returned! {}", error)
             }
         }
 
+        let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
+
+        urap_primary.write_4u8(u16::MAX, &mut buffer).unwrap_err();
+
+        let error = urap_secondary.pop_error().unwrap();
+        match error {
+            Error::CountExceedsBounds(_, _) => {}
+            _ => {
+                panic!("Incorrect Error Returned! {}", error)
+            }
+        }
+        
+        let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
+        
+        urap_primary.write_4u8(u16::MAX, &[f32::INFINITY.to_le_bytes()]).unwrap();
+       
         let mut registers = registers.lock().unwrap();
 
         assert_eq!(registers[0], f32::INFINITY.to_le_bytes());
         assert_eq!(registers[1], 42_u32.to_le_bytes());
         assert_eq!(registers[2], 0_i32.to_le_bytes());
 
+        assert_eq!(registers[u16::MAX as usize], f32::INFINITY.to_le_bytes());
+
         registers[2] = (-1_i32).to_le_bytes();
-
         drop(registers);
-
-        assert_eq!(urap_primary.is_healthy(), false);
-
-        let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
-
-        let mut buffer: [[u8; URAP_DATA_WIDTH]; 3] = [[0; URAP_DATA_WIDTH]; 3];
 
         urap_primary.read_4u8(0, &mut buffer).unwrap();
         
         assert_eq!(f32::from_le_bytes(buffer[0]), f32::INFINITY);
         assert_eq!(u32::from_le_bytes(buffer[1]), 42);
         assert_eq!(i32::from_le_bytes(buffer[2]), -1);
-
+       
         drop(urap_secondary);
 
         if secondary_path.exists() {
