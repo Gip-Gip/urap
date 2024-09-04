@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     vec::Vec,
+    time::Duration,
 };
 
 pub struct UrapSecondary {
@@ -40,12 +41,29 @@ impl UrapSecondary {
                         thread::spawn(move || {
                             let mut stream: StdIo<UnixStream> = stream.into();
  
-                            let mut urap_secondary = UrapSecondaryProto::new(
-                                &mut stream,
-                                &writeprotect,
-                            );
 
                             loop {
+                                let mut errors = error_cpy.lock().unwrap();
+                                
+                                if let Some(e) = stream.get_inner().take_error().unwrap_or(None) {
+                                    errors.push(e.into());
+                                    // Terminate the connection if there's an error, to prevent
+                                    // either side from hanging
+                                    stream
+                                        .get_inner_mut()
+                                        .shutdown(Shutdown::Both)
+                                        .unwrap_or_default();
+
+                                    drop(errors);
+                                    return;
+                                }
+                                
+                                drop(errors);
+
+                                let mut urap_secondary = UrapSecondaryProto::new(
+                                    &mut stream,
+                                    &writeprotect,
+                                );
                                 let result = urap_secondary.poll();
 
                                 let mut errors = error_cpy.lock().unwrap();
@@ -60,7 +78,7 @@ impl UrapSecondary {
                                         .unwrap_or_default();
 
                                     drop(errors);
-                                    break;
+                                    return;
                                 } else if let Ok(result) = result {
                                     if let Some(packet) = result {
 
@@ -93,7 +111,7 @@ impl UrapSecondary {
 
                                             drop(registers);
                                             drop(errors);
-                                            break;
+                                            return;
                                         }
 
                                         if nak_code.is_some() {
@@ -106,10 +124,15 @@ impl UrapSecondary {
 
                                             drop(registers);
                                             drop(errors);
-                                            break; 
+                                            return; 
                                         }
 
                                         drop(registers)
+                                    } else { // If no bytes are read, we reached the end of file
+                                             // and the pipe has been shut down. Kill the thread
+                                             // and return.
+                                        drop(errors);
+                                        return;
                                     }
                                 }
     
@@ -222,7 +245,7 @@ mod tests {
 
     #[test]
     fn unix_sockets() {
-        const RCOUNT: usize = u16::MAX as usize + 1;
+        const RCOUNT: usize = u16::MAX as usize;
         let registers = Arc::new(Mutex::new([[0u8; URAP_DATA_WIDTH]; RCOUNT]));
 
         let mut write_protect: [bool; RCOUNT] = [false; RCOUNT];
@@ -269,7 +292,19 @@ mod tests {
 
         let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
 
-        urap_primary.write_4u8(u16::MAX, &mut buffer).unwrap_err();
+        urap_primary.write_4u8(u16::MAX, &[f32::INFINITY.to_le_bytes()]).unwrap_err();
+
+        let error = urap_secondary.pop_error().unwrap();
+        match error {
+            Error::OutOfBounds(_) => {}
+            _ => {
+                panic!("Incorrect Error Returned! {}", error)
+            }
+        }
+
+        let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
+
+        urap_primary.write_4u8(u16::MAX-2, &mut buffer).unwrap_err();
 
         let error = urap_secondary.pop_error().unwrap();
         match error {
@@ -281,7 +316,7 @@ mod tests {
         
         let mut urap_primary = UrapPrimary::new(SLAVE_PATH).unwrap();
         
-        urap_primary.write_4u8(u16::MAX, &[f32::INFINITY.to_le_bytes()]).unwrap();
+        urap_primary.write_4u8(u16::MAX -1, &[f32::INFINITY.to_le_bytes()]).unwrap();
        
         let mut registers = registers.lock().unwrap();
 
@@ -289,7 +324,7 @@ mod tests {
         assert_eq!(registers[1], 42_u32.to_le_bytes());
         assert_eq!(registers[2], 0_i32.to_le_bytes());
 
-        assert_eq!(registers[u16::MAX as usize], f32::INFINITY.to_le_bytes());
+        assert_eq!(registers[u16::MAX as usize - 1], f32::INFINITY.to_le_bytes());
 
         registers[2] = (-1_i32).to_le_bytes();
         drop(registers);
@@ -303,8 +338,19 @@ mod tests {
         let mut buffer: [[u8; URAP_DATA_WIDTH]; URAP_COUNT_MAX] = [[0; URAP_DATA_WIDTH]; URAP_COUNT_MAX];
 
         urap_primary.write_4u8(128, &buffer).unwrap();
+
+        let  mut urap_primary_2 = UrapPrimary::new(SLAVE_PATH).unwrap();
+        urap_primary_2.write_4u8(0, &[f32::INFINITY.to_le_bytes()]).unwrap();
+        urap_primary_2.read_4u8(0, &mut buffer[..1]).unwrap();
+
+        assert_eq!(f32::from_le_bytes(buffer[0]), f32::INFINITY);
+        
         urap_primary.read_4u8(128, &mut buffer).unwrap();
-       
+
+        if let Some(e) = urap_secondary.pop_error() {
+            panic!("{}", e);
+        }
+
         drop(urap_secondary);
 
         if secondary_path.exists() {
